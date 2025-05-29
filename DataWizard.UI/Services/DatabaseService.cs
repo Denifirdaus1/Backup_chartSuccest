@@ -1,82 +1,124 @@
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
-using System.Collections.Generic;
-using System.Diagnostics;
 
 namespace DataWizard.UI.Services
 {
     public class DatabaseService
     {
-        private readonly HttpClient _client;
+        private readonly HttpClient _httpClient;
         private readonly string _supabaseUrl;
-        private readonly string _anonKey;
+        private readonly string _supabaseKey;
 
         public DatabaseService()
         {
             _supabaseUrl = "https://rrlmejrtlqnfaavyrrtf.supabase.co";
-            _anonKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJybG1lanJ0bHFuZmFhdnlycnRmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDgyMzI5NzUsImV4cCI6MjA2MzgwODk3NX0.8uC7og_bfk2C-Ok6KNGAY5Ej-nz_wBz07-94BG1rUZY";
-            
-            _client = new HttpClient();
-            _client.DefaultRequestHeaders.Add("apikey", _anonKey);
-            _client.DefaultRequestHeaders.Add("Authorization", $"Bearer {_anonKey}");
+            _supabaseKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJybG1lanJ0bHFuZmFhdnlycnRmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDgyMzI5NzUsImV4cCI6MjA2MzgwODk3NX0.8uC7og_bfk2C-Ok6KNGAY5Ej-nz_wBz07-94BG1rUZY";
+
+            _httpClient = new HttpClient();
+            _httpClient.DefaultRequestHeaders.Add("apikey", _supabaseKey);
+            _httpClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {_supabaseKey}");
+            _httpClient.DefaultRequestHeaders.Add("Prefer", "return=representation");
         }
 
-        private async Task<T> SendRequestAsync<T>(string endpoint, HttpMethod method, object data = null)
+        public async Task<(bool success, UserData user, string error)> ValidateUserCredentialsAsync(string username, string password)
         {
             try
             {
-                var request = new HttpRequestMessage(method, $"{_supabaseUrl}/rest/v1/{endpoint}");
-                
-                if (data != null)
+                Debug.WriteLine($"Attempting login for user: {username}");
+
+                var payload = new
                 {
-                    var json = JsonSerializer.Serialize(data);
-                    request.Content = new StringContent(json, Encoding.UTF8, "application/json");
-                }
+                    p_username = username,
+                    p_password = password
+                };
 
-                request.Headers.Add("Prefer", "return=representation");
+                var jsonContent = JsonSerializer.Serialize(payload);
+                Debug.WriteLine($"Login payload: {jsonContent}");
 
-                var response = await _client.SendAsync(request);
-                response.EnsureSuccessStatusCode();
+                var response = await _httpClient.PostAsync(
+                    $"{_supabaseUrl}/rest/v1/rpc/fn_user_login",
+                    new StringContent(jsonContent, Encoding.UTF8, "application/json")
+                );
 
                 var content = await response.Content.ReadAsStringAsync();
-                return JsonSerializer.Deserialize<T>(content, new JsonSerializerOptions
+                Debug.WriteLine($"Login API Response Status: {response.StatusCode}");
+                Debug.WriteLine($"Response content: {content}");
+
+                if (response.IsSuccessStatusCode)
                 {
-                    PropertyNameCaseInsensitive = true
-                });
+                    var options = new JsonSerializerOptions
+                    {
+                        PropertyNameCaseInsensitive = true
+                    };
+
+                    var loginResults = JsonSerializer.Deserialize<List<LoginResult>>(content, options);
+                    Debug.WriteLine($"Deserialized results: {JsonSerializer.Serialize(loginResults, options)}");
+
+                    var result = loginResults?.FirstOrDefault();
+                    if (result != null)
+                    {
+                        Debug.WriteLine($"Login status: {result.LoginStatus}");
+                        Debug.WriteLine($"User ID: {result.Id}");
+
+                        if (result.LoginStatus == 0 && result.Id != null)
+                        {
+                            // Explicitly update last_login_at if needed
+                            await UpdateLastLoginAsync(result.Id.Value);
+
+                            Debug.WriteLine("Login successful");
+                            return (true, new UserData
+                            {
+                                UserId = result.Id.Value,
+                                Username = result.Username,
+                                Email = result.Email,
+                                FullName = result.FullName
+                            }, null);
+                        }
+                    }
+
+                    Debug.WriteLine("Login failed - invalid credentials");
+                    return (false, null, "Invalid username or password");
+                }
+
+                Debug.WriteLine($"Login failed - HTTP {response.StatusCode}");
+                return (false, null, $"Login failed: {content}");
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"API Error: {ex.Message}");
-                throw;
+                Debug.WriteLine($"Login Error: {ex}");
+                return (false, null, $"Database error: {ex.Message}");
             }
         }
 
-        public async Task<(bool success, string error)> ValidateUserCredentialsAsync(string username, string password)
+        private async Task UpdateLastLoginAsync(Guid userId)
         {
             try
             {
-                var users = await SendRequestAsync<List<dynamic>>(
-                    $"users?username=eq.{username}&password=eq.{password}&select=id,username,email,full_name",
-                    HttpMethod.Get);
+                var updatePayload = new { last_login_at = DateTime.UtcNow };
+                var jsonContent = JsonSerializer.Serialize(updatePayload);
 
-                if (users != null && users.Count > 0)
+                var response = await _httpClient.PatchAsync(
+                    $"{_supabaseUrl}/rest/v1/users?id=eq.{userId}",
+                    new StringContent(jsonContent, Encoding.UTF8, "application/json")
+                );
+
+                Debug.WriteLine($"Update last_login_at response: {response.StatusCode}");
+                if (!response.IsSuccessStatusCode)
                 {
-                    await SendRequestAsync<dynamic>(
-                        $"users?id=eq.{users[0].id}",
-                        HttpMethod.Patch,
-                        new { last_login_at = DateTime.UtcNow });
-
-                    return (true, null);
+                    var errorContent = await response.Content.ReadAsStringAsync();
+                    Debug.WriteLine($"Failed to update last_login_at: {errorContent}");
                 }
-
-                return (false, "Invalid username or password");
             }
             catch (Exception ex)
             {
-                return (false, $"Database error: {ex.Message}");
+                Debug.WriteLine($"Error updating last_login_at: {ex.Message}");
             }
         }
 
@@ -84,129 +126,227 @@ namespace DataWizard.UI.Services
         {
             try
             {
+                var hashedPassword = BCrypt.Net.BCrypt.HashPassword(password);
+
+                var checkResponse = await _httpClient.PostAsync(
+                    $"{_supabaseUrl}/rest/v1/rpc/fn_check_user_exists",
+                    new StringContent(
+                        JsonSerializer.Serialize(new
+                        {
+                            p_username = username,
+                            p_email = email
+                        }),
+                        Encoding.UTF8,
+                        "application/json"
+                    )
+                );
+
+                if (checkResponse.IsSuccessStatusCode)
+                {
+                    var content = await checkResponse.Content.ReadAsStringAsync();
+                    var userExists = JsonSerializer.Deserialize<bool>(content);
+
+                    if (userExists)
+                    {
+                        return (false, "Username or email already exists");
+                    }
+                }
+                else
+                {
+                    var errorContent = await checkResponse.Content.ReadAsStringAsync();
+                    return (false, $"Duplicate check failed: {errorContent}");
+                }
+
                 var newUser = new
                 {
                     username = username,
-                    password = password,
+                    password_hash = hashedPassword,
                     email = email,
-                    full_name = fullName ?? string.Empty,
-                    created_at = DateTime.UtcNow
+                    full_name = fullName ?? string.Empty
                 };
 
-                await SendRequestAsync<dynamic>("users", HttpMethod.Post, newUser);
-                return (true, null);
+                var response = await _httpClient.PostAsync(
+                    $"{_supabaseUrl}/rest/v1/users",
+                    new StringContent(
+                        JsonSerializer.Serialize(newUser),
+                        Encoding.UTF8,
+                        "application/json"
+                    )
+                );
+
+                if (response.IsSuccessStatusCode)
+                {
+                    return (true, null);
+                }
+                else
+                {
+                    var errorContent = await response.Content.ReadAsStringAsync();
+                    return (false, $"Failed to create user: {errorContent}");
+                }
             }
             catch (Exception ex)
             {
-                if (ex.Message.Contains("duplicate"))
-                {
-                    return (false, "Username or email already exists");
-                }
                 return (false, $"Database error: {ex.Message}");
             }
         }
 
         public async Task<List<OutputFile>> GetRecentFilesAsync(int userId, int count = 4)
         {
+            var files = new List<OutputFile>();
             try
             {
-                var files = await SendRequestAsync<List<OutputFile>>(
-                    $"output_files?user_id=eq.{userId}&order=created_at.desc&limit={count}",
-                    HttpMethod.Get);
-                return files ?? new List<OutputFile>();
+                var response = await _httpClient.GetAsync(
+                    $"{_supabaseUrl}/rest/v1/output_files?select=file_id,file_name,file_path,file_size,created_date,history!inner(user_id)&history.user_id=eq.{userId}&order=created_date.desc&limit={count}"
+                );
+
+                if (response.IsSuccessStatusCode)
+                {
+                    var content = await response.Content.ReadAsStringAsync();
+                    var fileData = JsonSerializer.Deserialize<OutputFileResponse[]>(content, new JsonSerializerOptions
+                    {
+                        PropertyNameCaseInsensitive = true
+                    });
+
+                    if (fileData != null)
+                    {
+                        foreach (var file in fileData)
+                        {
+                            files.Add(new OutputFile
+                            {
+                                FileId = file.FileId,
+                                FileName = file.FileName,
+                                FilePath = file.FilePath,
+                                FileSize = file.FileSize,
+                                CreatedDate = file.CreatedDate
+                            });
+                        }
+                    }
+                }
             }
             catch (Exception ex)
             {
                 Debug.WriteLine($"Error fetching recent files: {ex.Message}");
-                return new List<OutputFile>();
             }
+            return files;
         }
 
         public async Task<List<Folder>> GetUserFoldersAsync(int userId, int count = 4)
         {
+            var folders = new List<Folder>();
             try
             {
-                var folders = await SendRequestAsync<List<Folder>>(
-                    $"folders?user_id=eq.{userId}&order=updated_at.desc&limit={count}",
-                    HttpMethod.Get);
-                return folders ?? new List<Folder>();
+                var response = await _httpClient.GetAsync(
+                    $"{_supabaseUrl}/rest/v1/folders?user_id=eq.{userId}&select=folder_id,folder_name,created_date&order=last_modified_date.desc&limit={count}"
+                );
+
+                if (response.IsSuccessStatusCode)
+                {
+                    var content = await response.Content.ReadAsStringAsync();
+                    var folderData = JsonSerializer.Deserialize<FolderResponse[]>(content, new JsonSerializerOptions
+                    {
+                        PropertyNameCaseInsensitive = true
+                    });
+
+                    if (folderData != null)
+                    {
+                        foreach (var folder in folderData)
+                        {
+                            folders.Add(new Folder
+                            {
+                                FolderId = folder.FolderId,
+                                FolderName = folder.FolderName,
+                                CreatedDate = folder.CreatedDate
+                            });
+                        }
+                    }
+                }
             }
             catch (Exception ex)
             {
                 Debug.WriteLine($"Error fetching folders: {ex.Message}");
-                return new List<Folder>();
             }
+            return folders;
         }
 
         public async Task<List<ChartData>> GetFileTypeStatsAsync(int userId)
         {
+            var stats = new List<ChartData>();
             try
             {
-                var stats = await SendRequestAsync<List<ChartData>>(
-                    $"rpc/get_input_file_type_stats?p_user_id={userId}",
-                    HttpMethod.Post);
-                return stats ?? new List<ChartData>();
+                var response = await _httpClient.PostAsync(
+                    $"{_supabaseUrl}/rest/v1/rpc/fn_get_input_file_type_stats",
+                    new StringContent(JsonSerializer.Serialize(new { p_user_id = userId }), Encoding.UTF8, "application/json")
+                );
+
+                if (response.IsSuccessStatusCode)
+                {
+                    var content = await response.Content.ReadAsStringAsync();
+                    var chartData = JsonSerializer.Deserialize<FileTypeStatsResponse[]>(content, new JsonSerializerOptions
+                    {
+                        PropertyNameCaseInsensitive = true
+                    });
+
+                    if (chartData != null)
+                    {
+                        foreach (var item in chartData)
+                        {
+                            stats.Add(new ChartData
+                            {
+                                Label = item.FileType,
+                                Value = (int)item.UsageCount
+                            });
+                        }
+                    }
+                }
             }
             catch (Exception ex)
             {
                 Debug.WriteLine($"Error fetching file type stats: {ex.Message}");
-                return new List<ChartData>();
             }
-        }
-
-        public async Task<string> GetUserPreferredFormatAsync(int userId)
-        {
-            try
-            {
-                var preferences = await SendRequestAsync<List<dynamic>>(
-                    $"user_preferences?user_id=eq.{userId}&select=format",
-                    HttpMethod.Get);
-                
-                if (preferences != null && preferences.Count > 0)
-                {
-                    return preferences[0].format;
-                }
-                return "Excel";
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"Error getting user format preference: {ex.Message}");
-                return "Excel";
-            }
-        }
-
-        public async Task SaveUserPreferredFormatAsync(int userId, string format)
-        {
-            try
-            {
-                var preference = new { user_id = userId, format = format };
-                await SendRequestAsync<dynamic>("user_preferences", HttpMethod.Post, preference);
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"Error saving user format preference: {ex.Message}");
-            }
+            return stats;
         }
 
         public async Task<int> LogHistoryAsync(int userId, int inputFileTypeId, int outputFormatId, string prompt, string processType)
         {
+            Debug.WriteLine($"[LogHistoryAsync] Starting history logging for UserID: {userId}");
+
             try
             {
-                var history = new
+                var historyData = new
                 {
                     user_id = userId,
-                    input_file_type_id = inputFileTypeId,
+                    input_file_type = inputFileTypeId,
                     output_format_id = outputFormatId,
-                    prompt_text = prompt,
-                    process_type = processType
+                    processing_time = 0
                 };
 
-                var result = await SendRequestAsync<dynamic>("history", HttpMethod.Post, history);
-                return result?.id ?? -1;
+                var response = await _httpClient.PostAsync(
+                    $"{_supabaseUrl}/rest/v1/history",
+                    new StringContent(JsonSerializer.Serialize(historyData), Encoding.UTF8, "application/json")
+                );
+
+                if (response.IsSuccessStatusCode)
+                {
+                    var content = await response.Content.ReadAsStringAsync();
+                    var historyResult = JsonSerializer.Deserialize<HistoryResponse[]>(content, new JsonSerializerOptions
+                    {
+                        PropertyNameCaseInsensitive = true
+                    });
+
+                    if (historyResult != null && historyResult.Length > 0)
+                    {
+                        int historyId = historyResult[0].HistoryId;
+                        Debug.WriteLine($"[LogHistoryAsync] Successfully logged history. HistoryID: {historyId}");
+                        return historyId;
+                    }
+                }
+
+                Debug.WriteLine($"[LogHistoryAsync] Failed to log history: {response.StatusCode}");
+                return -1;
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"Error logging history: {ex.Message}");
+                Debug.WriteLine($"[LogHistoryAsync] Error: {ex.Message}");
                 return -1;
             }
         }
@@ -215,10 +355,17 @@ namespace DataWizard.UI.Services
         {
             try
             {
-                await SendRequestAsync<dynamic>(
-                    $"history?id=eq.{historyId}",
-                    HttpMethod.Patch,
-                    new { processing_time = processingTimeMs });
+                var updateData = new { processing_time = processingTimeMs };
+
+                var response = await _httpClient.PatchAsync(
+                    $"{_supabaseUrl}/rest/v1/history?history_id=eq.{historyId}",
+                    new StringContent(JsonSerializer.Serialize(updateData), Encoding.UTF8, "application/json")
+                );
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    Debug.WriteLine($"Failed to update processing time: {response.StatusCode}");
+                }
             }
             catch (Exception ex)
             {
@@ -226,34 +373,27 @@ namespace DataWizard.UI.Services
             }
         }
 
-        public async Task UpdateHistoryStatusAsync(int historyId, bool isSuccess, int processingTimeMs)
-        {
-            try
-            {
-                await SendRequestAsync<dynamic>(
-                    $"history?id=eq.{historyId}",
-                    HttpMethod.Patch,
-                    new { is_success = isSuccess, processing_time = processingTimeMs });
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"Error updating history status: {ex.Message}");
-            }
-        }
-
         public async Task LogOutputFileAsync(int historyId, string fileName, string filePath, long fileSize)
         {
             try
             {
-                var outputFile = new
+                var fileData = new
                 {
                     history_id = historyId,
-                    name = fileName,
-                    path = filePath,
-                    size = fileSize
+                    file_name = fileName,
+                    file_path = filePath,
+                    file_size = fileSize
                 };
 
-                await SendRequestAsync<dynamic>("output_files", HttpMethod.Post, outputFile);
+                var response = await _httpClient.PostAsync(
+                    $"{_supabaseUrl}/rest/v1/output_files",
+                    new StringContent(JsonSerializer.Serialize(fileData), Encoding.UTF8, "application/json")
+                );
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    Debug.WriteLine($"Failed to log output file: {response.StatusCode}");
+                }
             }
             catch (Exception ex)
             {
@@ -265,21 +405,29 @@ namespace DataWizard.UI.Services
         {
             try
             {
-                var fileTypes = await SendRequestAsync<List<dynamic>>(
-                    $"file_types?name=eq.{typeName}&select=id",
-                    HttpMethod.Get);
+                var response = await _httpClient.GetAsync(
+                    $"{_supabaseUrl}/rest/v1/file_types?type_name=eq.{typeName}&select=file_type_id"
+                );
 
-                if (fileTypes != null && fileTypes.Count > 0)
+                if (response.IsSuccessStatusCode)
                 {
-                    return fileTypes[0].id;
+                    var content = await response.Content.ReadAsStringAsync();
+                    var fileTypes = JsonSerializer.Deserialize<FileTypeResponse[]>(content, new JsonSerializerOptions
+                    {
+                        PropertyNameCaseInsensitive = true
+                    });
+
+                    if (fileTypes != null && fileTypes.Length > 0)
+                    {
+                        return fileTypes[0].FileTypeId;
+                    }
                 }
 
-                // Default to 'OTHER' if type not found
-                return await GetFileTypeId("OTHER");
+                return await GetFileTypeId("PDF");
             }
             catch
             {
-                return await GetFileTypeId("OTHER");
+                return 1;
             }
         }
 
@@ -287,15 +435,25 @@ namespace DataWizard.UI.Services
         {
             try
             {
-                var formats = await SendRequestAsync<List<dynamic>>(
-                    $"output_formats?name=eq.{formatName}&select=id",
-                    HttpMethod.Get);
+                var response = await _httpClient.GetAsync(
+                    $"{_supabaseUrl}/rest/v1/output_formats?format_name=eq.{formatName}&select=output_format_id"
+                );
 
-                if (formats != null && formats.Count > 0)
+                if (response.IsSuccessStatusCode)
                 {
-                    return formats[0].id;
+                    var content = await response.Content.ReadAsStringAsync();
+                    var formats = JsonSerializer.Deserialize<OutputFormatResponse[]>(content, new JsonSerializerOptions
+                    {
+                        PropertyNameCaseInsensitive = true
+                    });
+
+                    if (formats != null && formats.Length > 0)
+                    {
+                        return formats[0].OutputFormatId;
+                    }
                 }
-                return 1; // Default to Excel (ID=1)
+
+                return 1;
             }
             catch
             {
@@ -305,42 +463,128 @@ namespace DataWizard.UI.Services
 
         public async Task<List<HistoryItem>> GetRecentHistoryAsync(int userId, int count)
         {
+            var historyList = new List<HistoryItem>();
+
             try
             {
-                var query = $@"history?user_id=eq.{userId}
-                    &select=id,input_file_type_id(name),output_format_id(name),
-                    process_date,processing_time,is_success,process_type
-                    &order=process_date.desc
-                    &limit={count}";
+                var response = await _httpClient.GetAsync(
+                    $"{_supabaseUrl}/rest/v1/history?user_id=eq.{userId}&select=history_id,process_date,processing_time,file_types!inner(type_name),output_formats!inner(format_name)&order=process_date.desc&limit={count}"
+                );
 
-                var history = await SendRequestAsync<List<dynamic>>(query, HttpMethod.Get);
-                var historyList = new List<HistoryItem>();
-
-                foreach (var item in history)
+                if (response.IsSuccessStatusCode)
                 {
-                    historyList.Add(new HistoryItem
+                    var content = await response.Content.ReadAsStringAsync();
+                    var historyData = JsonSerializer.Deserialize<HistoryItemResponse[]>(content, new JsonSerializerOptions
                     {
-                        HistoryId = item.id,
-                        InputType = item.input_file_type_id.name,
-                        OutputFormat = item.output_format_id.name,
-                        ProcessDate = item.process_date,
-                        ProcessingTime = item.processing_time,
-                        IsSuccess = item.is_success,
-                        ProcessType = item.process_type
+                        PropertyNameCaseInsensitive = true
                     });
-                }
 
-                return historyList;
+                    if (historyData != null)
+                    {
+                        foreach (var item in historyData)
+                        {
+                            historyList.Add(new HistoryItem
+                            {
+                                HistoryId = item.HistoryId,
+                                InputType = item.FileTypes?.TypeName ?? "Unknown",
+                                OutputFormat = item.OutputFormats?.FormatName ?? "Unknown",
+                                ProcessDate = item.ProcessDate,
+                                ProcessingTime = item.ProcessingTime ?? 0,
+                                IsSuccess = true,
+                                ProcessType = "Processing"
+                            });
+                        }
+                    }
+                }
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"Error in GetRecentHistoryAsync: {ex}");
+                Debug.WriteLine($"Error in GetRecentHistoryAsync: {ex.Message}");
                 throw;
             }
+
+            return historyList;
+        }
+
+        public void Dispose()
+        {
+            _httpClient?.Dispose();
         }
     }
 
-    // Model classes remain unchanged
+    public class LoginResult
+    {
+        public Guid? Id { get; set; }
+        public string Username { get; set; }
+        public string Email { get; set; }
+        public string FullName { get; set; }
+        public int LoginStatus { get; set; }
+    }
+
+    public class UserData
+    {
+        public Guid UserId { get; set; }
+        public string Username { get; set; }
+        public string Email { get; set; }
+        public string FullName { get; set; }
+    }
+
+    public class OutputFileResponse
+    {
+        public int FileId { get; set; }
+        public string FileName { get; set; }
+        public string FilePath { get; set; }
+        public long FileSize { get; set; }
+        public DateTime CreatedDate { get; set; }
+    }
+
+    public class FolderResponse
+    {
+        public int FolderId { get; set; }
+        public string FolderName { get; set; }
+        public DateTime CreatedDate { get; set; }
+    }
+
+    public class FileTypeStatsResponse
+    {
+        public string FileType { get; set; }
+        public long UsageCount { get; set; }
+    }
+
+    public class HistoryResponse
+    {
+        public int HistoryId { get; set; }
+    }
+
+    public class FileTypeResponse
+    {
+        public int FileTypeId { get; set; }
+    }
+
+    public class OutputFormatResponse
+    {
+        public int OutputFormatId { get; set; }
+    }
+
+    public class HistoryItemResponse
+    {
+        public int HistoryId { get; set; }
+        public DateTime ProcessDate { get; set; }
+        public int? ProcessingTime { get; set; }
+        public FileTypeInfo FileTypes { get; set; }
+        public OutputFormatInfo OutputFormats { get; set; }
+    }
+
+    public class FileTypeInfo
+    {
+        public string TypeName { get; set; }
+    }
+
+    public class OutputFormatInfo
+    {
+        public string FormatName { get; set; }
+    }
+
     public class OutputFile
     {
         public int FileId { get; set; }
