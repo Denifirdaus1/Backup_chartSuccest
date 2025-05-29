@@ -1,109 +1,207 @@
 using System;
-using System.Net.Http;
-using System.Text;
-using System.Text.Json;
 using System.Threading.Tasks;
 
 namespace DataWizard.UI.Services
 {
     public class AuthenticationService
     {
-        private readonly HttpClient _client;
-        private readonly string _supabaseUrl;
-        private readonly string _anonKey;
+        private readonly DatabaseService _dbService;
+        private UserData _currentUser;
 
         public AuthenticationService()
         {
-            _supabaseUrl = "https://rrlmejrtlqnfaavyrrtf.supabase.co";
-            _anonKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJybG1lanJ0bHFuZmFhdnlycnRmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDgyMzI5NzUsImV4cCI6MjA2MzgwODk3NX0.8uC7og_bfk2C-Ok6KNGAY5Ej-nz_wBz07-94BG1rUZY";
-
-            _client = new HttpClient();
-            _client.DefaultRequestHeaders.Add("apikey", _anonKey);
-            _client.DefaultRequestHeaders.Add("Authorization", $"Bearer {_anonKey}");
+            _dbService = new DatabaseService();
         }
+
+        public UserData CurrentUser => _currentUser;
+
+        public event EventHandler<AuthenticationStateChangedEventArgs> AuthenticationStateChanged;
 
         public async Task<(bool success, string error)> SignInAsync(string username, string password)
         {
             try
             {
-                var request = new HttpRequestMessage(HttpMethod.Get, $"{_supabaseUrl}/rest/v1/users?username=eq.{username}&select=*");
-                request.Headers.Add("Prefer", "return=representation");
+                var result = await _dbService.ValidateUserCredentialsAsync(username, password);
 
-                var response = await _client.SendAsync(request);
-                var content = await response.Content.ReadAsStringAsync();
-
-                if (!response.IsSuccessStatusCode)
+                if (result.success && result.user != null)
                 {
-                    return (false, $"Login failed: {response.StatusCode}");
-                }
-
-                var users = JsonSerializer.Deserialize<JsonElement[]>(content);
-                if (users == null || users.Length == 0)
-                {
-                    return (false, "User not found");
-                }
-
-                var user = users[0];
-                if (user.GetProperty("password").GetString() == password)
-                {
-                    // Update last login
-                    var updateRequest = new HttpRequestMessage(HttpMethod.Patch, 
-                        $"{_supabaseUrl}/rest/v1/users?id=eq.{user.GetProperty("id").GetString()}");
-                    
-                    var updateData = JsonSerializer.Serialize(new { last_login_at = DateTime.UtcNow });
-                    updateRequest.Content = new StringContent(updateData, Encoding.UTF8, "application/json");
-                    updateRequest.Headers.Add("Prefer", "return=minimal");
-                    
-                    await _client.SendAsync(updateRequest);
+                    _currentUser = result.user;
+                    OnAuthenticationStateChanged(new AuthenticationStateChangedEventArgs(true, _currentUser));
                     return (true, null);
                 }
 
-                return (false, "Invalid password");
+                return (false, result.error);
             }
             catch (Exception ex)
             {
-                return (false, $"Authentication error: {ex.Message}");
+                return (false, $"Sign in failed: {ex.Message}");
             }
         }
 
-        public async Task<(bool success, string error)> SignUpAsync(string username, string password, string email)
+        public async Task<(bool success, string error)> SignUpAsync(string username, string password, string email, string fullName = null)
         {
             try
             {
-                var request = new HttpRequestMessage(HttpMethod.Post, $"{_supabaseUrl}/rest/v1/users");
-                
-                var userData = new
-                {
-                    id = Guid.NewGuid(),
-                    username = username,
-                    password = password,
-                    email = email,
-                    created_at = DateTime.UtcNow,
-                    is_active = true
-                };
+                if (string.IsNullOrWhiteSpace(username))
+                    return (false, "Username is required");
 
-                var json = JsonSerializer.Serialize(userData);
-                request.Content = new StringContent(json, Encoding.UTF8, "application/json");
-                request.Headers.Add("Prefer", "return=minimal");
+                if (string.IsNullOrWhiteSpace(password))
+                    return (false, "Password is required");
 
-                var response = await _client.SendAsync(request);
-                if (response.IsSuccessStatusCode)
-                {
-                    return (true, null);
-                }
+                if (string.IsNullOrWhiteSpace(email))
+                    return (false, "Email is required");
 
-                var errorContent = await response.Content.ReadAsStringAsync();
-                if (errorContent.Contains("duplicate"))
-                {
-                    return (false, "Username or email already exists");
-                }
+                if (!IsValidEmail(email))
+                    return (false, "Invalid email format");
 
-                return (false, $"Registration failed: {errorContent}");
+                if (password.Length < 6)
+                    return (false, "Password must be at least 6 characters long");
+
+                var result = await _dbService.CreateUserAsync(username, password, email, fullName);
+                return result;
             }
             catch (Exception ex)
             {
-                return (false, $"Registration error: {ex.Message}");
+                return (false, $"Sign up failed: {ex.Message}");
             }
+        }
+
+        public void SignOut()
+        {
+            _currentUser = null;
+            OnAuthenticationStateChanged(new AuthenticationStateChangedEventArgs(false, null));
+        }
+
+        public bool IsAuthenticated => _currentUser != null;
+
+        public Guid? GetCurrentUserId()
+        {
+            return _currentUser?.UserId;
+        }
+
+        public string GetCurrentUsername()
+        {
+            return _currentUser?.Username;
+        }
+
+        public string GetCurrentUserEmail()
+        {
+            return _currentUser?.Email;
+        }
+
+        public string GetCurrentUserFullName()
+        {
+            return _currentUser?.FullName;
+        }
+
+        private bool IsValidEmail(string email)
+        {
+            try
+            {
+                var addr = new System.Net.Mail.MailAddress(email);
+                return addr.Address == email;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public async Task<bool> RefreshCurrentUserAsync()
+        {
+            if (_currentUser == null)
+                return false;
+
+            try
+            {
+                var result = await _dbService.ValidateUserCredentialsAsync(_currentUser.Username, "");
+                if (result.success && result.user != null)
+                {
+                    _currentUser = result.user;
+                    OnAuthenticationStateChanged(new AuthenticationStateChangedEventArgs(true, _currentUser));
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Error refreshing user data: {ex.Message}");
+            }
+
+            return false;
+        }
+
+        public void UpdateCurrentUser(UserData updatedUser)
+        {
+            if (updatedUser != null && _currentUser != null && _currentUser.UserId == updatedUser.UserId)
+            {
+                _currentUser = updatedUser;
+                OnAuthenticationStateChanged(new AuthenticationStateChangedEventArgs(true, _currentUser));
+            }
+        }
+
+        protected virtual void OnAuthenticationStateChanged(AuthenticationStateChangedEventArgs e)
+        {
+            AuthenticationStateChanged?.Invoke(this, e);
+        }
+
+        public async Task<bool> ValidateCurrentSessionAsync()
+        {
+            if (_currentUser == null)
+                return false;
+
+            try
+            {
+                return true;
+            }
+            catch
+            {
+                SignOut();
+                return false;
+            }
+        }
+
+        public void Dispose()
+        {
+            _dbService?.Dispose();
+        }
+    }
+
+    public class AuthenticationStateChangedEventArgs : EventArgs
+    {
+        public bool IsAuthenticated { get; }
+        public UserData User { get; }
+
+        public AuthenticationStateChangedEventArgs(bool isAuthenticated, UserData user)
+        {
+            IsAuthenticated = isAuthenticated;
+            User = user;
+        }
+    }
+
+    public static class UserDataExtensions
+    {
+        public static string GetDisplayName(this UserData user)
+        {
+            if (user == null) return string.Empty;
+
+            return !string.IsNullOrWhiteSpace(user.FullName)
+                ? user.FullName
+                : user.Username;
+        }
+
+        public static string GetInitials(this UserData user)
+        {
+            if (user == null) return string.Empty;
+
+            var displayName = user.GetDisplayName();
+            if (string.IsNullOrWhiteSpace(displayName))
+                return string.Empty;
+
+            var parts = displayName.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 1)
+                return parts[0].Substring(0, Math.Min(2, parts[0].Length)).ToUpper();
+
+            return (parts[0].Substring(0, 1) + parts[parts.Length - 1].Substring(0, 1)).ToUpper();
         }
     }
 }
