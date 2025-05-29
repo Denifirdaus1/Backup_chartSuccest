@@ -13,20 +13,17 @@ using Microsoft.UI.Xaml.Shapes;
 using Windows.UI.Text;
 using Microsoft.UI.Text;
 using System.Collections.Generic;
-using DataWizardUI.Helpers;
-using Microsoft.UI.Dispatching;
-using Windows.System;
+using ScottPlot;
+using System.Linq;
 
 namespace DataWizard.UI.Pages
 {
     public sealed partial class HomePage : Page
     {
         private readonly DatabaseService _dbService;
+        private readonly int _currentUserId = 1; // Temporary hardcoded user ID
         private ObservableCollection<OutputFile> _recentFiles;
         private ObservableCollection<Folder> _folders;
-        private ObservableCollection<ChartData> _chartData;
-        private readonly ChartHelper _chartHelper;
-        private readonly int _currentUserId = 1; // hardcoded
 
         public HomePage()
         {
@@ -34,144 +31,82 @@ namespace DataWizard.UI.Pages
             _dbService = new DatabaseService();
             _recentFiles = new ObservableCollection<OutputFile>();
             _folders = new ObservableCollection<Folder>();
-            _chartData = new ObservableCollection<ChartData>();
-
-
-            _chartHelper = new ChartHelper(
-                "Server=DESKTOP-01G7KT1\\SQLEXPRESS;Database=Quicklisticks;Trusted_Connection=True;");
-
-            // Mulai satu-satunya pipeline inisialisasi data & UI
-            _ = InitializePageAsync();
-        }
-
-
-
-        private async void LoadData()
-        {
-            try
-            {
-                var recentFiles = await _dbService.GetRecentFilesAsync(_currentUserId);
-                var folders = await _dbService.GetUserFoldersAsync(_currentUserId);
-                var chartData = await _dbService.GetFileTypeStatsAsync(_currentUserId);
-                var history = await _dbService.GetRecentHistoryAsync(_currentUserId, 5);
-
-                _recentFiles.Clear();
-                _folders.Clear();
-                _chartData.Clear();
-
-                foreach (var file in recentFiles)
-                {
-                    _recentFiles.Add(file);
-                }
-
-                foreach (var folder in folders)
-                {
-                    _folders.Add(folder);
-                }
-
-                foreach (var data in chartData)
-                {
-                    _chartData.Add(data);
-                }
-
-                UpdateRecentFiles(history);
-                UpdateFolders();
-                UpdateChart();
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"Error loading data: {ex.Message}");
-                await ShowErrorDialog("Failed to load data", ex.Message);
-            }
-        }
-        private async Task InitializePageAsync()
-        {
-            await LoadDataAsync();   // di sini juga sudah termasuk refresh chart
-        }
-
-        private async Task LoadChartDataAsync()
-{
-    try
-    {
-        Debug.WriteLine("Memulai load data chart...");
-
-        var (values, labels) = await _chartHelper.GetFileTypeUsageDataAsync(_currentUserId);
-
-        Debug.WriteLine($"Data yang diterima:");
-        Debug.WriteLine($"Labels: {string.Join(", ", labels)}");
-        Debug.WriteLine($"Values: {string.Join(", ", values)}");
-
-        // Gunakan TryEnqueue sebagai ganti EnqueueAsync
-        DispatcherQueue.TryEnqueue(() =>
-        {
-            _chartHelper.ConfigureColumnChart(UsageChart, values, labels);
-        });
-    }
-    catch (Exception ex)
-    {
-        Debug.WriteLine($"Error LoadChartDataAsync: {ex}");
-    }
-}
-
-        private void UsageChart_Loaded(object sender, RoutedEventArgs e)
-        {
-            Debug.WriteLine("Chart control loaded");
-            _ = LoadChartDataAsync();
+            
+            // Initialize data
+            _ = LoadDataAsync();
         }
 
         private async Task LoadDataAsync()
         {
             try
             {
-                // 1. Ambil data Recent Files, Folders, ChartData (untuk binding lama), dan History
-                var recentFiles = await _dbService.GetRecentFilesAsync(_currentUserId);
-                var folders = await _dbService.GetUserFoldersAsync(_currentUserId);
-                var chartData = await _dbService.GetFileTypeStatsAsync(_currentUserId);
-                var history = await _dbService.GetRecentHistoryAsync(_currentUserId, 5);
-
-                // 2. Update koleksi ObservableCollection milikmu
+                // Load recent files
+                var recentFiles = await _dbService.GetRecentFilesAsync(_currentUserId, 5);
                 _recentFiles.Clear();
                 foreach (var file in recentFiles)
+                {
                     _recentFiles.Add(file);
+                }
 
+                // Load folders
+                var folders = await _dbService.GetUserFoldersAsync(_currentUserId);
                 _folders.Clear();
                 foreach (var folder in folders)
+                {
                     _folders.Add(folder);
+                }
 
-                _chartData.Clear();
-                foreach (var data in chartData)
-                    _chartData.Add(data);
-
-                // 3. Update UI panel Recent Files dan Folders
+                // Load recent history for activity display
+                var history = await _dbService.GetRecentHistoryAsync(_currentUserId, 5);
                 UpdateRecentFiles(history);
                 UpdateFolders();
 
-                // 4. Refresh ScottPlot chart dengan data baru dari DB
-                var (values, labels) = await _chartHelper.GetFileTypeUsageDataAsync();
-                _chartHelper.ConfigureColumnChart(UsageChart, values, labels);
+                // Load chart data
+                await LoadChartDataAsync();
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"Error loading data: {ex}");
-                await ShowErrorDialog("Failed to load data", ex.Message);
+                Debug.WriteLine($"Error loading data: {ex.Message}");
+                await ShowErrorDialog("Error", "Failed to load data. Please try again.");
             }
         }
 
-        private async Task ShowErrorDialog(string title, string message)
+        private async Task LoadChartDataAsync()
         {
-            ContentDialog dialog = new ContentDialog
+            try
             {
-                Title = title,
-                Content = message,
-                CloseButtonText = "OK",
-                XamlRoot = this.XamlRoot
-            };
-            await dialog.ShowAsync();
+                var stats = await _dbService.GetFileTypeStatsAsync(_currentUserId);
+                
+                if (stats != null && stats.Any())
+                {
+                    var plt = UsageChart.Plot;
+                    plt.Clear();
+
+                    // Extract data for plotting
+                    var values = stats.Select(s => (double)s.Value).ToArray();
+                    var labels = stats.Select(s => s.Label).ToArray();
+
+                    // Create bar plot
+                    var bar = plt.AddBar(values);
+                    plt.XTicks(Enumerable.Range(0, labels.Length).Select(i => (double)i).ToArray(), labels);
+                    
+                    // Customize appearance
+                    plt.Title("File Type Usage");
+                    plt.YLabel("Count");
+                    
+                    UsageChart.Refresh();
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error loading chart: {ex.Message}");
+            }
         }
 
         private void UpdateRecentFiles(List<HistoryItem> historyItems)
         {
             RecentFilesPanel.Children.Clear();
+
             foreach (var item in historyItems)
             {
                 var historyControl = new StackPanel
@@ -186,16 +121,17 @@ namespace DataWizard.UI.Pages
                 {
                     Width = 24,
                     Height = 24,
-                    Source = GetFormatIcon(item.OutputFormat)
+                    Source = new BitmapImage(new Uri($"ms-appx:///Assets/Microsoft {item.OutputFormat} 2024.png"))
                 };
 
                 // Add text information
                 var textPanel = new StackPanel();
                 textPanel.Children.Add(new TextBlock
                 {
-                    Text = $"{item.InputType} ? {item.OutputFormat}",
+                    Text = $"{item.InputType} → {item.OutputFormat}",
                     FontWeight = FontWeights.SemiBold
                 });
+
                 textPanel.Children.Add(new TextBlock
                 {
                     Text = FormatTime(item.ProcessDate),
@@ -210,283 +146,74 @@ namespace DataWizard.UI.Pages
             }
         }
 
-        private BitmapImage GetFormatIcon(string format)
-        {
-            string iconPath = format.ToLower() switch
-            {
-                "word" => "ms-appx:///Assets/Microsoft Word 2024.png",
-                "excel" => "ms-appx:///Assets/Microsoft Excel 2025.png",
-                _ => "ms-appx:///Assets/File.png"
-            };
-            return new BitmapImage(new Uri(iconPath));
-        }
-
-        private string FormatTime(DateTime date)
-        {
-            TimeSpan diff = DateTime.Now - date;
-            if (diff.TotalMinutes < 1) return "Just now";
-            if (diff.TotalHours < 1) return $"{(int)diff.TotalMinutes}m ago";
-            if (diff.TotalDays < 1) return $"{(int)diff.TotalHours}h ago";
-            return date.ToString("dd MMM yyyy");
-        }
-        private string FormatFileSize(long bytes)
-        {
-            string[] sizes = { "B", "KB", "MB", "GB" };
-            int order = 0;
-            double len = bytes;
-
-            while (len >= 1024 && order < sizes.Length - 1)
-            {
-                order++;
-                len = len / 1024;
-            }
-
-            return $"{len:0.##} {sizes[order]}";
-        }
         private void UpdateFolders()
         {
             FoldersPanel.Children.Clear();
             foreach (var folder in _folders)
             {
-                FoldersPanel.Children.Add(new FolderItem
+                var folderItem = new StackPanel
                 {
-                    FolderName = folder.FolderName
-                });
+                    Orientation = Orientation.Horizontal,
+                    Spacing = 12,
+                    Margin = new Thickness(0, 0, 0, 16)
+                };
+
+                var icon = new Image
+                {
+                    Width = 24,
+                    Height = 24,
+                    Source = new BitmapImage(new Uri("ms-appx:///Assets/Folder.png"))
+                };
+
+                var textBlock = new TextBlock
+                {
+                    Text = folder.FolderName,
+                    FontWeight = FontWeights.SemiBold,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+
+                folderItem.Children.Add(icon);
+                folderItem.Children.Add(textBlock);
+
+                FoldersPanel.Children.Add(folderItem);
             }
         }
-        private void UpdateChart()
+
+        private string FormatTime(DateTime date)
         {
-            // Update chart visualization based on _chartData
-            // Implementation depends on your charting library
+            var diff = DateTime.Now - date;
+            if (diff.TotalMinutes < 1) return "Just now";
+            if (diff.TotalHours < 1) return $"{(int)diff.TotalMinutes}m ago";
+            if (diff.TotalDays < 1) return $"{(int)diff.TotalHours}h ago";
+            return date.ToString("dd MMM yyyy");
         }
 
-        private string GetFileType(string fileName)
+        private async Task ShowErrorDialog(string title, string message)
         {
-            var extension = System.IO.Path.GetExtension(fileName).ToLower();
-            switch (extension)
+            ContentDialog dialog = new ContentDialog
             {
-                case ".xlsx":
-                    return "Excel";
-                case ".docx":
-                    return "Word";
-                default:
-                    return "Unknown";
-            }
-        }
-        // ... [Rest of your existing methods remain unchanged] ...
-        #region Event Handlers
-        private void AddButton_Click(object sender, RoutedEventArgs e)
-        {
-            // Handle Add button click
+                Title = title,
+                Content = message,
+                CloseButtonText = "OK",
+                XamlRoot = this.XamlRoot
+            };
+            await dialog.ShowAsync();
         }
 
-        private void SearchButton_Click(object sender, RoutedEventArgs e)
+        private void UsageChart_Loaded(object sender, RoutedEventArgs e)
         {
-            // Handle Search button click
-        }
-
-        private void HomeButton_Click(object sender, RoutedEventArgs e)
-        {
-            // Already on home page
-        }
-
-        private void FolderButton_Click(object sender, RoutedEventArgs e)
-        {
-            // Navigate to folders page
-        }
-
-        private void HistoryButton_Click(object sender, RoutedEventArgs e)
-        {
-            // Navigate to history page
-        }
-
-        private void SettingsButton_Click(object sender, RoutedEventArgs e)
-        {
-            // Navigate to settings page
-        }
-
-        private void UserProfileButton_Click(object sender, RoutedEventArgs e)
-        {
-            // Show user profile menu or navigate to profile page
-            // You can implement this based on your requirements
-            // For now, we'll just show a simple message
-            Debug.WriteLine("User profile button clicked");
-
-            // Example: Show a flyout or dialog
-            /*
-            var flyout = new MenuFlyout();
-            flyout.Items.Add(new MenuFlyoutItem { Text = "My Profile" });
-            flyout.Items.Add(new MenuFlyoutItem { Text = "Settings" });
-            flyout.Items.Add(new MenuFlyoutItem { Text = "Sign Out" });
-            flyout.ShowAt(UserProfileButton);
-            */
+            _ = LoadChartDataAsync();
         }
 
         private void NewProjectButton_Click(object sender, RoutedEventArgs e)
         {
-            // Start new project
-            this.Frame.Navigate(typeof(DataWizard.UI.Pages.ChatPage));
-        }
-        #endregion
-    }
-    public sealed class FileItem : Grid
-    {
-        public FileItem()
-        {
-            this.Background = new SolidColorBrush(Colors.LightBlue);
-            this.CornerRadius = new CornerRadius(8);
-            this.Padding = new Thickness(24, 12, 24, 12);
-
-            var sp = new StackPanel
-            {
-                Orientation = Orientation.Horizontal
-            };
-
-            var fileNameText = new TextBlock
-            {
-                FontSize = 14,
-                FontWeight = FontWeights.SemiBold,
-                VerticalAlignment = VerticalAlignment.Center
-            };
-
-            fileNameText.SetBinding(TextBlock.TextProperty,
-                new Microsoft.UI.Xaml.Data.Binding() { Path = new PropertyPath("FileName") });
-
-            var rightContent = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                Margin = new Thickness(16, 0, 0, 0)
-            };
-
-            var separator = new Border
-            {
-                Width = 1,
-                Height = 24,
-                Background = new SolidColorBrush(Colors.Black)
-            };
-
-            var fileIcon = new Image
-            {
-                Width = 24,
-                Height = 24,
-                Margin = new Thickness(16, 0, 0, 0)
-            };
-
-            fileIcon.SetBinding(Image.SourceProperty,
-                new Microsoft.UI.Xaml.Data.Binding()
-                {
-                    Path = new PropertyPath("FileType"),
-                    Converter = new FileTypeToIconConverter()
-                });
-
-            rightContent.Children.Add(separator);
-            rightContent.Children.Add(fileIcon);
-
-            sp.Children.Add(fileNameText);
-            sp.Children.Add(rightContent);
-
-            this.Children.Add(sp);
+            Frame.Navigate(typeof(ChatPage));
         }
 
-        public string FileName
+        private void UserProfileButton_Click(object sender, RoutedEventArgs e)
         {
-            get => (string)GetValue(FileNameProperty);
-            set => SetValue(FileNameProperty, value);
-        }
-
-        public string FileType
-        {
-            get => (string)GetValue(FileTypeProperty);
-            set => SetValue(FileTypeProperty, value);
-        }
-
-        public static readonly DependencyProperty FileNameProperty =
-            DependencyProperty.Register(nameof(FileName), typeof(string),
-                typeof(FileItem), new PropertyMetadata(string.Empty));
-
-        public static readonly DependencyProperty FileTypeProperty =
-            DependencyProperty.Register(nameof(FileType), typeof(string),
-                typeof(FileItem), new PropertyMetadata(string.Empty));
-    }
-
-    public sealed class FolderItem : Grid
-    {
-        public FolderItem()
-        {
-            this.Background = new SolidColorBrush(Colors.LightBlue);
-            this.CornerRadius = new CornerRadius(8);
-            this.Padding = new Thickness(24, 12, 24, 12);
-
-            var sp = new StackPanel
-            {
-                Orientation = Orientation.Horizontal
-            };
-
-            var folderNameText = new TextBlock
-            {
-                FontSize = 14,
-                FontWeight = FontWeights.SemiBold,
-                VerticalAlignment = VerticalAlignment.Center
-            };
-
-            folderNameText.SetBinding(TextBlock.TextProperty,
-                new Microsoft.UI.Xaml.Data.Binding() { Path = new PropertyPath("FolderName") });
-
-            var rightContent = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                Margin = new Thickness(16, 0, 0, 0)
-            };
-
-            var separator = new Border
-            {
-                Width = 1,
-                Height = 24,
-                Background = new SolidColorBrush(Colors.Black)
-            };
-
-            var folderIcon = new FontIcon
-            {
-                FontFamily = new FontFamily("Segoe MDL2 Assets"),
-                Glyph = "\uE8B7",
-                FontSize = 20,
-                Margin = new Thickness(16, 0, 0, 0)
-            };
-
-            rightContent.Children.Add(separator);
-            rightContent.Children.Add(folderIcon);
-
-            sp.Children.Add(folderNameText);
-            sp.Children.Add(rightContent);
-
-            this.Children.Add(sp);
-        }
-
-        public string FolderName
-        {
-            get => (string)GetValue(FolderNameProperty);
-            set => SetValue(FolderNameProperty, value);
-        }
-
-        public static readonly DependencyProperty FolderNameProperty =
-            DependencyProperty.Register(nameof(FolderName), typeof(string),
-                typeof(FolderItem), new PropertyMetadata(string.Empty));
-    }
-
-    public class FileTypeToIconConverter : Microsoft.UI.Xaml.Data.IValueConverter
-    {
-        public object Convert(object value, Type targetType,
-            object parameter, string language)
-        {
-            string fileType = value as string;
-            return new BitmapImage(
-                new Uri($"ms-appx:///Assets/{fileType.ToLower()}.png"));
-        }
-
-        public object ConvertBack(object value, Type targetType,
-            object parameter, string language)
-        {
-            throw new NotImplementedException();
+            // Implement user profile functionality
+            Debug.WriteLine("User profile button clicked");
         }
     }
 }
